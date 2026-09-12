@@ -2,21 +2,37 @@
 IGAUTO — Daily Quote Instagram Bot
 -----------------------------------
 Fetches a daily quote, renders it as a square image, picks a matching
-song + hashtags, uploads the image to Imgur (for a public URL), and
-publishes it to Instagram via the Graph API.
+song + hashtags, and publishes it to Instagram via the Graph API.
+
+The image is hosted by committing it into this (public) GitHub repo and
+referencing its raw.githubusercontent.com URL — Instagram's API requires
+a public image URL, and this avoids needing a separate image-hosting
+service. This is why the script runs in two phases (see below) with a
+git commit+push in between, orchestrated by the GitHub Actions workflow.
 
 Environment variables required (set as GitHub Actions secrets):
     IG_ACCESS_TOKEN   - long-lived Instagram access token
     IG_USER_ID        - Instagram business account ID (numeric)
-    IMGUR_CLIENT_ID   - Imgur app Client ID (for anonymous image upload)
+
+Provided automatically by GitHub Actions (no setup needed):
+    GITHUB_REPOSITORY - "owner/repo"
+    GITHUB_REF_NAME    - branch name (e.g. "main")
 
 Optional:
-    DRY_RUN=true      - generate everything but skip the Imgur upload
-                        and the actual Instagram publish (safe testing)
+    DRY_RUN=true      - generate everything but skip the Instagram publish
+                        (safe testing)
+
+Usage:
+    python bot.py prepare   # fetch quote, render image, write posts/<date>/
+                             # (commit + push this before "publish")
+    python bot.py publish   # read today's posts/<date>/record.json and
+                             # publish it to Instagram using the now-public
+                             # raw GitHub URL for the image
 """
 
 import os
 import io
+import sys
 import json
 import time
 import random
@@ -32,8 +48,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "")
 IG_USER_ID = os.environ.get("IG_USER_ID", "")
-IMGUR_CLIENT_ID = os.environ.get("IMGUR_CLIENT_ID", "")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # "owner/repo", auto-set in Actions
+GITHUB_REF_NAME = os.environ.get("GITHUB_REF_NAME", "main")  # branch, auto-set in Actions
 
 GRAPH_API_VERSION = "v22.0"
 GRAPH_HOST = "https://graph.instagram.com"  # Instagram API with Instagram Login
@@ -340,22 +358,19 @@ def render_quote_image(quote, author, out_path):
 
 
 # --------------------------------------------------------------------------
-# Imgur upload (public URL host for the Instagram API)
+# Public image URL (hosted via this GitHub repo instead of a 3rd party)
 # --------------------------------------------------------------------------
 
-def upload_to_imgur(image_path):
-    with open(image_path, "rb") as f:
-        resp = requests.post(
-            "https://api.imgur.com/3/image",
-            headers={"Authorization": f"Client-ID {IMGUR_CLIENT_ID}"},
-            files={"image": f},
-            timeout=30,
+def build_public_image_url(date_str):
+    if not GITHUB_REPOSITORY:
+        raise EnvironmentError(
+            "GITHUB_REPOSITORY is not set. This should be run inside GitHub "
+            "Actions, or set it manually as 'owner/repo' for local testing."
         )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"Imgur upload failed: {data}")
-    return data["data"]["link"]
+    return (
+        f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}/"
+        f"{GITHUB_REF_NAME}/posts/{date_str}/quote.jpg"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -404,34 +419,49 @@ def publish_container(creation_id):
 # Local record-keeping
 # --------------------------------------------------------------------------
 
-def save_local_record(date_str, quote, author, theme, song_title, song_artist, hashtags, image_path, media_id=None):
+def save_record(date_str, quote, author, theme, song_title, song_artist, hashtags, caption, media_id=None):
     day_dir = os.path.join(POSTS_DIR, date_str)
     os.makedirs(day_dir, exist_ok=True)
 
-    saved_image_path = os.path.join(day_dir, "quote.jpg")
-    Image.open(image_path).save(saved_image_path)
+    record_path = os.path.join(day_dir, "record.json")
+    record = {}
+    if os.path.exists(record_path):
+        with open(record_path) as f:
+            record = json.load(f)
 
-    record = {
+    record.update({
         "date": date_str,
         "quote": quote,
         "author": author,
         "theme": theme,
         "song": {"title": song_title, "artist": song_artist},
         "hashtags": hashtags,
-        "instagram_media_id": media_id,
+        "caption": caption,
         "dry_run": DRY_RUN,
-    }
-    with open(os.path.join(day_dir, "record.json"), "w") as f:
+    })
+    if media_id is not None:
+        record["instagram_media_id"] = media_id
+
+    with open(record_path, "w") as f:
         json.dump(record, f, indent=2)
+    return record
+
+
+def load_record(date_str):
+    record_path = os.path.join(POSTS_DIR, date_str, "record.json")
+    with open(record_path) as f:
+        return json.load(f)
 
 
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
-def main():
+def cmd_prepare():
+    """Phase 1: fetch quote, render image, write posts/<date>/. Commit and
+    push this (the workflow does that) before running 'publish'."""
     today = dt.date.today().isoformat()
-    print(f"[info] Running IGAUTO daily post for {today} (DRY_RUN={DRY_RUN})")
+    print(f"[info] Preparing daily post for {today} (DRY_RUN={DRY_RUN})")
 
     quote, author = fetch_quote()
     theme = detect_theme(quote)
@@ -442,34 +472,57 @@ def main():
     print(f"[info] Quote: \"{quote}\" — {author}")
     print(f"[info] Theme: {theme} | Song: {song_title} by {song_artist}")
 
-    tmp_image_path = "/tmp/quote_card.jpg"
-    render_quote_image(quote, author, tmp_image_path)
-    print(f"[info] Image rendered at {tmp_image_path}")
+    day_dir = os.path.join(POSTS_DIR, today)
+    os.makedirs(day_dir, exist_ok=True)
+    image_path = os.path.join(day_dir, "quote.jpg")
+    render_quote_image(quote, author, image_path)
+    print(f"[info] Image rendered at {image_path}")
 
-    media_id = None
+    save_record(today, quote, author, theme, song_title, song_artist, hashtags, caption)
+    print("[info] Wrote posts/{}/record.json — commit and push this next.".format(today))
+
+
+def cmd_publish():
+    """Phase 2: read today's prepared record and publish it to Instagram
+    using the now-public (already pushed) raw GitHub URL for the image."""
+    today = dt.date.today().isoformat()
+    record = load_record(today)
+    caption = record["caption"]
+
     if DRY_RUN:
-        print("[info] DRY_RUN is on — skipping Imgur upload and Instagram publish.")
+        print("[info] DRY_RUN is on — skipping Instagram publish.")
         print("----- CAPTION PREVIEW -----")
         print(caption)
         print("----------------------------")
-    else:
-        if not (IG_ACCESS_TOKEN and IG_USER_ID and IMGUR_CLIENT_ID):
-            raise EnvironmentError(
-                "Missing one of IG_ACCESS_TOKEN, IG_USER_ID, IMGUR_CLIENT_ID."
-            )
-        image_url = upload_to_imgur(tmp_image_path)
-        print(f"[info] Uploaded to Imgur: {image_url}")
+        return
 
-        creation_id = create_media_container(image_url, caption)
-        print(f"[info] Media container created: {creation_id}")
+    if not (IG_ACCESS_TOKEN and IG_USER_ID):
+        raise EnvironmentError("Missing IG_ACCESS_TOKEN or IG_USER_ID.")
 
-        wait_for_container_ready(creation_id)
-        media_id = publish_container(creation_id)
-        print(f"[info] Published! Instagram media ID: {media_id}")
+    image_url = build_public_image_url(today)
+    print(f"[info] Using image URL: {image_url}")
 
-    save_local_record(today, quote, author, theme, song_title, song_artist, hashtags, tmp_image_path, media_id)
-    print("[info] Local record saved under posts/.")
+    creation_id = create_media_container(image_url, caption)
+    print(f"[info] Media container created: {creation_id}")
+
+    wait_for_container_ready(creation_id)
+    media_id = publish_container(creation_id)
+    print(f"[info] Published! Instagram media ID: {media_id}")
+
+    save_record(
+        today, record["quote"], record["author"], record["theme"],
+        record["song"]["title"], record["song"]["artist"], record["hashtags"],
+        caption, media_id=media_id,
+    )
+    print("[info] Updated record.json with the Instagram media ID.")
 
 
 if __name__ == "__main__":
-    main()
+    command = sys.argv[1] if len(sys.argv) > 1 else "prepare"
+    if command == "prepare":
+        cmd_prepare()
+    elif command == "publish":
+        cmd_publish()
+    else:
+        print(f"Unknown command: {command!r}. Use 'prepare' or 'publish'.")
+        sys.exit(1)
