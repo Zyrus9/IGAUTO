@@ -48,6 +48,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "")
 IG_USER_ID = os.environ.get("IG_USER_ID", "")
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
+IG_HANDLE = os.environ.get("IG_HANDLE", "fragmentfiles")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "")  # "owner/repo", auto-set in Actions
@@ -56,7 +58,7 @@ GITHUB_REF_NAME = os.environ.get("GITHUB_REF_NAME", "main")  # branch, auto-set 
 GRAPH_API_VERSION = "v22.0"
 GRAPH_HOST = "https://graph.instagram.com"  # Instagram API with Instagram Login
 
-IMAGE_SIZE = (1080, 1080)
+IMAGE_SIZE = (1080, 1350)  # 4:5 portrait — tallest ratio Instagram allows for feed photos
 FONT_CACHE_DIR = os.path.join(os.path.dirname(__file__), "fonts")
 POSTS_DIR = os.path.join(os.path.dirname(__file__), "posts")
 
@@ -157,6 +159,17 @@ GENERIC_SONGS = [
     ("Three Little Birds", "Bob Marley"),
 ]
 
+# Search terms used to find a themed real-photo background via Pexels
+THEME_PHOTO_QUERIES = {
+    "love": ["romantic sunset silhouette", "roses soft light", "sunset beach couple"],
+    "success": ["mountain summit sunrise", "city skyline golden hour", "runner finish line"],
+    "motivation": ["ocean waves sunrise", "mountain peak clouds", "sunrise over mountains"],
+    "time": ["vintage clock", "hourglass sand", "clock tower sky"],
+    "growth": ["sunlight forest path", "seedling growing soil", "green plant sunrise"],
+    "wisdom": ["old books library", "candlelight desk books", "quiet library reading"],
+    "life": ["cherry blossom", "spring flowers field", "nature path forest"],
+}
+
 BACKGROUND_PALETTES = [
     ((25, 25, 40), (70, 40, 90)),      # deep indigo -> plum
     ((15, 40, 45), (10, 90, 90)),      # teal
@@ -166,15 +179,13 @@ BACKGROUND_PALETTES = [
 ]
 
 GOOGLE_FONT_URLS = {
-    "bold": "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Bold.ttf",
-    "regular": "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Regular.ttf",
-    "italic": "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-Italic.ttf",
+    "regular": "https://raw.githubusercontent.com/google/fonts/main/ofl/lora/Lora%5Bwght%5D.ttf",
+    "italic": "https://raw.githubusercontent.com/google/fonts/main/ofl/lora/Lora-Italic%5Bwght%5D.ttf",
 }
 
 SYSTEM_FONT_FALLBACKS = {
-    "bold": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "regular": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "italic": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+    "regular": "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "italic": "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
 }
 
 
@@ -259,7 +270,7 @@ def get_font(style, size):
     """style is 'bold' | 'regular' | 'italic'. Tries a cached/downloaded
     Google Font first, falls back to a system font, then PIL default."""
     os.makedirs(FONT_CACHE_DIR, exist_ok=True)
-    cached_path = os.path.join(FONT_CACHE_DIR, f"Poppins-{style}.ttf")
+    cached_path = os.path.join(FONT_CACHE_DIR, f"Lora-{style}.ttf")
 
     if not os.path.exists(cached_path):
         try:
@@ -279,6 +290,67 @@ def get_font(style, size):
 
     print("[warn] Falling back to PIL default bitmap font (low quality).")
     return ImageFont.load_default()
+
+
+def fetch_background_photo(theme):
+    """Get a real themed photo from Pexels for the card background.
+    Returns a PIL Image, or None if unavailable (caller should fall back
+    to the gradient background)."""
+    if not PEXELS_API_KEY:
+        print("[warn] No PEXELS_API_KEY set; using gradient background.")
+        return None
+
+    queries = list(THEME_PHOTO_QUERIES.get(theme, THEME_PHOTO_QUERIES["life"]))
+    random.shuffle(queries)
+    for query in queries:
+        try:
+            resp = requests.get(
+                "https://api.pexels.com/v1/search",
+                headers={"Authorization": PEXELS_API_KEY},
+                params={"query": query, "orientation": "portrait", "per_page": 15},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            photos = resp.json().get("photos", [])
+            if not photos:
+                continue
+            photo = random.choice(photos)
+            src = photo.get("src", {}).get("large2x") or photo.get("src", {}).get("original")
+            if not src:
+                continue
+            img_resp = requests.get(src, timeout=20)
+            img_resp.raise_for_status()
+            return Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+        except Exception as exc:
+            print(f"[warn] Pexels fetch failed for query {query!r}: {exc}")
+            continue
+
+    print("[warn] All Pexels attempts failed; using gradient background.")
+    return None
+
+
+def cover_crop(img, size):
+    """Resize + center-crop an image to exactly fill `size` (like CSS
+    background-size: cover)."""
+    target_w, target_h = size
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w, new_h = int(src_w * scale) + 1, int(src_h * scale) + 1
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return img.crop((left, top, left + target_w, top + target_h))
+
+
+def draw_letter_spaced(draw, xy, text, font, fill, spacing=3):
+    """Draw text with extra spacing between characters, centered at xy[0]
+    (xy is the CENTER x, top y)."""
+    widths = [draw.textlength(ch, font=font) for ch in text]
+    total_width = sum(widths) + spacing * (len(text) - 1)
+    x = xy[0] - total_width / 2
+    for ch, cw in zip(text, widths):
+        draw.text((x, xy[1]), ch, font=font, fill=fill)
+        x += cw + spacing
 
 
 def make_gradient_background(size):
@@ -311,37 +383,56 @@ def wrap_text_to_width(draw, text, font, max_width):
     return lines
 
 
-def render_quote_image(quote, author, out_path):
-    img = make_gradient_background(IMAGE_SIZE)
-    draw = ImageDraw.Draw(img)
+def render_quote_image(quote, author, theme, out_path):
     w, h = IMAGE_SIZE
-    margin = 100
+    photo = fetch_background_photo(theme)
+    if photo is not None:
+        base = cover_crop(photo, IMAGE_SIZE)
+    else:
+        base = make_gradient_background(IMAGE_SIZE)
+
+    img = base.convert("RGBA")
+
+    # Mild overall darkening so white text stays readable on any photo
+    overall_dim = Image.new("RGBA", (w, h), (0, 0, 0, 55))
+    img = Image.alpha_composite(img, overall_dim)
+
+    draw = ImageDraw.Draw(img)
+    margin = 110
     max_text_width = w - 2 * margin
 
     # Auto-shrink the quote font until it fits within a reasonable height
-    quote_font_size = 64
-    quote_font = get_font("bold", quote_font_size)
+    quote_font_size = 58
+    quote_font = get_font("regular", quote_font_size)
     lines = wrap_text_to_width(draw, quote, quote_font, max_text_width)
-    while len(lines) > 8 and quote_font_size > 36:
+    while len(lines) > 7 and quote_font_size > 34:
         quote_font_size -= 4
-        quote_font = get_font("bold", quote_font_size)
+        quote_font = get_font("regular", quote_font_size)
         lines = wrap_text_to_width(draw, quote, quote_font, max_text_width)
 
-    line_height = int(quote_font_size * 135 / 1000) + quote_font_size
+    line_height = int(quote_font_size * 1.45)
     total_text_height = line_height * len(lines)
-    author_font = get_font("italic", 34)
-    mark_font = get_font("bold", 160)
+    author_font = get_font("italic", 32)
+    handle_font = get_font("regular", 24)
 
-    mark_gap = 30
-    author_gap = 40
-    mark_height = mark_font.getbbox("\u201C")[3]
-    author_height = author_font.getbbox(f"— {author}")[3]
-
-    block_height = mark_height + mark_gap + total_text_height + author_gap + author_height
+    author_text = f"— {author}"
+    author_gap = 34
+    author_height = author_font.getbbox(author_text)[3]
+    block_height = total_text_height + author_gap + author_height
     y = (h - block_height) / 2
 
-    draw.text((margin - 10, y), "\u201C", font=mark_font, fill=(255, 255, 255, 90))
-    y += mark_height + mark_gap
+    # Soft dark scrim band behind the text block for guaranteed contrast,
+    # regardless of how bright/busy the underlying photo is
+    pad_x, pad_y = 60, 50
+    scrim = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    scrim_draw = ImageDraw.Draw(scrim)
+    scrim_draw.rounded_rectangle(
+        [margin - pad_x, y - pad_y, w - margin + pad_x, y + block_height + pad_y],
+        radius=28,
+        fill=(0, 0, 0, 85),
+    )
+    img = Image.alpha_composite(img, scrim)
+    draw = ImageDraw.Draw(img)
 
     for line in lines:
         line_width = draw.textlength(line, font=quote_font)
@@ -349,11 +440,14 @@ def render_quote_image(quote, author, out_path):
         draw.text((x, y), line, font=quote_font, fill="white")
         y += line_height
 
-    author_text = f"— {author}"
     author_width = draw.textlength(author_text, font=author_font)
-    draw.text(((w - author_width) / 2, y + author_gap), author_text, font=author_font, fill=(230, 230, 230))
+    draw.text(((w - author_width) / 2, y + author_gap), author_text, font=author_font, fill=(235, 235, 235))
 
-    img.save(out_path, "JPEG", quality=92)
+    # Handle watermark near the bottom, letter-spaced for an elegant look
+    handle_text = f"@{IG_HANDLE}"
+    draw_letter_spaced(draw, (w / 2, h - 90), handle_text, handle_font, (255, 255, 255, 230), spacing=3)
+
+    img.convert("RGB").save(out_path, "JPEG", quality=92)
     return out_path
 
 
@@ -475,7 +569,7 @@ def cmd_prepare():
     day_dir = os.path.join(POSTS_DIR, today)
     os.makedirs(day_dir, exist_ok=True)
     image_path = os.path.join(day_dir, "quote.jpg")
-    render_quote_image(quote, author, image_path)
+    render_quote_image(quote, author, theme, image_path)
     print(f"[info] Image rendered at {image_path}")
 
     save_record(today, quote, author, theme, song_title, song_artist, hashtags, caption)
