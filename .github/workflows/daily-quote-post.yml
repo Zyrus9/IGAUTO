@@ -29,18 +29,33 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Prepare today's quote + image
         env:
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          IMGUR_CLIENT_ID: ${{ secrets.IMGUR_CLIENT_ID }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
-        run: python bot.py
+        run: python bot.py prepare
 
-      - name: Commit generated post record
+      - name: Commit and push the generated image
         run: |
           git config user.name "igauto-bot"
           git config user.email "actions@users.noreply.github.com"
           git add posts/ fonts/ || true
-          git diff --quiet --cached || git commit -m "Daily quote post $(date -u +'%Y-%m-%d')"
+          git diff --quiet --cached || git commit -m "Prepare daily quote $(date -u +'%Y-%m-%d')"
+          git push
+
+      # A short pause so raw.githubusercontent.com has a moment to reflect
+      # the file that was just pushed, before Instagram tries to fetch it.
+      - name: Wait for raw GitHub URL to propagate
+        run: sleep 10
+
+      - name: Publish to Instagram
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: python bot.py publish
+
+      - name: Commit the Instagram media ID
+        run: |
+          git add posts/
+          git diff --quiet --cached || git commit -m "Record Instagram publish result $(date -u +'%Y-%m-%d')"
           git push
