@@ -595,6 +595,9 @@ def cmd_publish():
 
     image_url = build_public_image_url(today)
     print(f"[info] Using image URL: {image_url}")
+    print("----- CAPTION BEING SENT TO INSTAGRAM -----")
+    print(caption)
+    print("--------------------------------------------")
 
     creation_id = create_media_container(image_url, caption)
     print(f"[info] Media container created: {creation_id}")
