@@ -32,6 +32,7 @@ jobs:
       - name: Prepare today's quote + image
         env:
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: python bot.py prepare
 
       - name: Commit and push the generated image
